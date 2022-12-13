@@ -12,6 +12,6 @@ pub(crate) use kernel::Kernel;
 #[allow(clippy::module_inception)]
 pub(crate) mod probe;
 // Re-export probe.
-pub(crate) use probe::*;
+pub(crate) use self::probe::*;
 
 pub(crate) mod user;
