@@ -310,8 +310,7 @@ dependencies = [
 [[package]]
 name = "libbpf-rs"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae623007dfcd01956d889e06f2c003106573158fe61e88450e9f448466d6dbed"
+source = "git+https://github.com/libbpf/libbpf-rs.git?branch=master#3803482f8bf37dabaec76be996e094a595d0095d"
 dependencies = [
  "bitflags",
  "lazy_static",

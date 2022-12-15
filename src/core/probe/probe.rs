@@ -3,6 +3,7 @@ use std::{collections::HashMap, fmt};
 use anyhow::{bail, Result};
 
 use super::kernel::KernelProbe;
+use super::user::UsdtProbe;
 use crate::core::kernel;
 
 /// Probe types supported by this program. This is the main object given to
@@ -11,6 +12,8 @@ use crate::core::kernel;
 pub(crate) enum Probe {
     Kprobe(KernelProbe),
     RawTracepoint(KernelProbe),
+    #[allow(dead_code)]
+    Usdt(UsdtProbe),
 }
 
 impl Probe {
@@ -32,7 +35,7 @@ impl Probe {
 }
 
 // Use mem::variant_count::<Probe>() when available in stable.
-pub(crate) const PROBE_VARIANTS: usize = 2;
+pub(crate) const PROBE_VARIANTS: usize = 3;
 
 impl Probe {
     /// We do use probe types as indexes, the following makes it easy.
@@ -42,6 +45,7 @@ impl Probe {
         match self {
             Probe::Kprobe(_) => 0,
             Probe::RawTracepoint(_) => 1,
+            Probe::Usdt(_) => 2,
         }
     }
 }
@@ -52,6 +56,7 @@ impl fmt::Display for Probe {
         let name = match self {
             Probe::Kprobe(_) => "kprobe",
             Probe::RawTracepoint(_) => "raw tracepoint",
+            Probe::Usdt(_) => "usdt",
         };
         write!(f, "{}", name)
     }

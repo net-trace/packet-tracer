@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 use log::info;
 
-use super::*;
 #[cfg(not(test))]
 use super::kernel::config::init_config_map;
+use super::*;
 use super::{
     builder::ProbeBuilder,
     kernel::{kprobe, raw_tracepoint},
+    user::usdt,
 };
 use crate::core::events::bpf::BpfEvents;
 
@@ -47,8 +48,10 @@ impl ProbeManager {
         let dynamic_probes: [ProbeSet; probe::PROBE_VARIANTS] = [
             ProbeSet::new(Box::new(kprobe::KprobeBuilder::new())),
             ProbeSet::new(Box::new(raw_tracepoint::RawTracepointBuilder::new())),
+            ProbeSet::new(Box::new(usdt::UsdtBuilder::new())),
         ];
-        let targeted_probes: [Vec<ProbeSet>; probe::PROBE_VARIANTS] = [Vec::new(), Vec::new()];
+        let targeted_probes: [Vec<ProbeSet>; probe::PROBE_VARIANTS] = Default::default();
+
         // When testing the kernel object is not modified later to reuse the
         // config map is this map is hidden.
         #[allow(unused_mut)]
@@ -81,6 +84,7 @@ impl ProbeManager {
     pub(crate) fn add_probe(&mut self, probe: Probe) -> Result<()> {
         let key = match &probe {
             Probe::Kprobe(probe) | Probe::RawTracepoint(probe) => probe.symbol.name(),
+            Probe::Usdt(probe) => probe.name(),
         };
 
         // First check if it is already in the generic probe list.
@@ -161,6 +165,7 @@ impl ProbeManager {
     pub(crate) fn register_hook_to(&mut self, hook: Hook, probe: Probe) -> Result<()> {
         let key = match &probe {
             Probe::Kprobe(probe) | Probe::RawTracepoint(probe) => probe.symbol.name(),
+            Probe::Usdt(probe) => probe.name(),
         };
 
         // First check if the target isn't already registered to the generic
@@ -185,6 +190,7 @@ impl ProbeManager {
         let mut set = ProbeSet::new(match probe {
             Probe::Kprobe(_) => Box::new(kprobe::KprobeBuilder::new()),
             Probe::RawTracepoint(_) => Box::new(raw_tracepoint::RawTracepointBuilder::new()),
+            Probe::Usdt(_) => Box::new(usdt::UsdtBuilder::new()),
         });
 
         set.targets.insert(key, probe);
@@ -270,6 +276,7 @@ impl ProbeSet {
                         libbpf_rs::MapFlags::NO_EXIST,
                     )?;
                 }
+                _ => (),
             }
 
             // Finally attach a probe to the target.
