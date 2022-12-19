@@ -86,6 +86,7 @@ fn main() {
 
     // module::skb_tracking
     build_hook("src/module/skb_tracking/bpf/tracking_hook.bpf.c");
+    build_hook("src/module/ovs/bpf/main_hook.bpf.c");
 
     for inc in INCLUDE_PATHS.iter() {
         println!("cargo:rerun-if-changed={}", inc);
