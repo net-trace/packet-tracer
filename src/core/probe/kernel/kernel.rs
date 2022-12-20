@@ -40,7 +40,7 @@ impl KernelProbe {
 pub(crate) fn register_unmarshaler(events: &mut BpfEvents) -> Result<()> {
     events.register_unmarshaler(
         BpfEventOwner::Kernel,
-        Box::new(|raw_section, fields| {
+        Box::new(|raw_section, fields, _| {
             if raw_section.data.len() != 8 {
                 bail!(
                     "Section data is not the expected size {} != 8",
