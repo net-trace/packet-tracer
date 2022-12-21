@@ -1,9 +1,16 @@
 #![allow(dead_code)] // FIXME
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use super::{config::ProbeConfig, inspect::inspect_symbol};
-use crate::core::kernel::Symbol;
+use crate::core::{
+    events::{
+        bpf::{BpfEventOwner, BpfEvents},
+        EventField,
+    },
+    kernel::Symbol,
+};
+use crate::event_field;
 
 /// Kernel encapsulates all the information about a kernel probe (kprobe or tracepoint) needed to attach to it.
 pub(crate) struct KernelProbe {
@@ -27,4 +34,25 @@ impl KernelProbe {
             config: desc.probe_cfg,
         })
     }
+}
+
+/// Registers the unmarshaler for the kernel section of the event.
+pub(crate) fn register_unmarshaler(events: &mut BpfEvents) -> Result<()> {
+    events.register_unmarshaler(
+        BpfEventOwner::Kernel,
+        Box::new(|raw_section, fields| {
+            if raw_section.data.len() != 8 {
+                bail!(
+                    "Section data is not the expected size {} != 8",
+                    raw_section.data.len()
+                );
+            }
+
+            let symbol = u64::from_ne_bytes(raw_section.data[0..8].try_into()?);
+
+            fields.push(event_field!("symbol", Symbol::from_addr(symbol)?.name()));
+            Ok(())
+        }),
+    )?;
+    Ok(())
 }
