@@ -8,14 +8,14 @@ use log::info;
 #[cfg(not(test))]
 use super::config::init_config_map;
 use super::{
-    inspect::{Inspector, TargetDesc},
+    inspect::{inspect_symbol, TargetDesc},
     kprobe, raw_tracepoint,
 };
-use crate::core::events::bpf::BpfEvents;
+use crate::core::{events::bpf::BpfEvents, kernel::Symbol};
 
 /// Probes types supported by this crate.
 #[allow(dead_code)]
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProbeType {
     Kprobe,
     RawTracepoint,
@@ -67,7 +67,6 @@ pub(crate) struct Kernel {
     hooks: Vec<Hook>,
     #[cfg(not(test))]
     config_map: libbpf_rs::Map,
-    pub(crate) inspect: Inspector,
 }
 
 // Keep in sync with their BPF counterparts in bpf/include/common.h
@@ -77,7 +76,7 @@ pub(super) const HOOK_MAX: usize = 10;
 struct ProbeSet {
     r#type: ProbeType,
     builder: Box<dyn ProbeBuilder>,
-    targets: HashMap<String, TargetDesc>,
+    targets: HashMap<String, Symbol>,
     hooks: Vec<Hook>,
 }
 
@@ -113,7 +112,6 @@ impl Kernel {
             hooks: Vec::new(),
             #[cfg(not(test))]
             config_map: init_config_map()?,
-            inspect: Inspector::new()?,
         };
 
         #[cfg(not(test))]
@@ -127,6 +125,39 @@ impl Kernel {
         Ok(kernel)
     }
 
+    /// Request to attach a probe of type r#type to a symbol.
+    ///
+    /// ```
+    /// kernel.add_probe_to_symbol(
+    ///     ProbeType::Kprobe, Symbol::from_name("kfree_skb_reason").unwrap()).unwrap();
+    /// kernel.add_probe_to_symbol(
+    ///     ProbeType::RawTracepoint, Symbol::from_name("kfree_skb").unwrap()).unwrap();
+    /// ```
+    pub(crate) fn add_probe_to_symbol(&mut self, r#type: ProbeType, symbol: Symbol) -> Result<()> {
+        let key = symbol.name();
+
+        // First check if it is already in the generic probe list.
+        let set = &mut self.probes[r#type as usize];
+        if set.targets.contains_key(&key) {
+            return Ok(());
+        }
+
+        // Then if it is already in the targeted probe list.
+        for set in self.targeted_probes.iter_mut() {
+            if r#type == set.r#type && set.targets.get(&key).is_some() {
+                return Ok(());
+            }
+        }
+
+        // Finally check the request type is compatible with the symbol type.
+        if !symbol.can_probe(r#type) {
+            bail!("Can't probe using probe type {:?} on {}", r#type, symbol);
+        }
+
+        set.targets.insert(key, symbol);
+        Ok(())
+    }
+
     /// Request to attach a probe of type r#type to a target identifier.
     ///
     /// ```
@@ -134,31 +165,8 @@ impl Kernel {
     /// kernel.add_probe(ProbeType::RawTracepoint, "kfree_skb").unwrap();
     /// ```
     pub(crate) fn add_probe(&mut self, r#type: ProbeType, target: &str) -> Result<()> {
-        let target = target.to_string();
-
-        // First check if it is already in the generic probe list.
-        let set = &mut self.probes[r#type as usize];
-        if set.targets.contains_key(&target) {
-            return Ok(());
-        }
-
-        // Then if it is already in the targeted probe list.
-        for set in self.targeted_probes.iter_mut() {
-            if r#type == set.r#type && set.targets.get(&target).is_some() {
-                return Ok(());
-            }
-        }
-
-        // Filling the probe description here helps in returning errors early to
-        // the caller if a target isn't found or is incompatible.
-        let desc = self.inspect.inspect_target(&r#type, &target)?;
-
-        // Yes, we do it twice, because of the other mut ref for
-        // self.inspect_target.
-        let set = &mut self.probes[r#type as usize];
-        set.targets.insert(target, desc);
-
-        Ok(())
+        let symbol = Symbol::from_name(target)?;
+        self.add_probe_to_symbol(r#type, symbol)
     }
 
     /// Request to reuse a map fd. Useful for sharing maps across probes, for
@@ -204,6 +212,69 @@ impl Kernel {
         Ok(())
     }
 
+    /// Request a hook to be attached to a specific symbol.
+    ///
+    /// ```
+    /// mod hook {
+    ///     include!("bpf/.out/hook.rs");
+    /// }
+    ///
+    /// [...]
+    ///
+    /// kernel.register_hook_to_symbol(
+    ///     hook::DATA, ProbeType::Kprobe, Symbol::from_name("kfree_skb_reason").unwrap())?;
+    /// ```
+    pub(crate) fn register_hook_to_symbol(
+        &mut self,
+        hook: Hook,
+        r#type: ProbeType,
+        symbol: Symbol,
+    ) -> Result<()> {
+        let key = symbol.name();
+
+        // First check if the target isn't already registered to the generic
+        // probes list. If so, remove it from there.
+        let target_set = &mut self.probes[r#type as usize];
+        target_set.targets.remove(&key);
+
+        // Now check if we already have a targeted probe for this. If so, append
+        // the new hook to it.
+        for set in self.targeted_probes.iter_mut() {
+            if r#type == set.r#type && set.targets.get(&key).is_some() {
+                if self.hooks.len() + set.hooks.len() == HOOK_MAX {
+                    bail!("Hook list is already full");
+                }
+                set.hooks.push(hook);
+                return Ok(());
+            }
+        }
+
+        // Finally check the request type is compatible with the symbol type.
+        if !symbol.can_probe(r#type) {
+            bail!("Can't probe using probe type {:?} on {}", r#type, symbol);
+        }
+
+        // New target, let's build a new probe set.
+        let mut set = ProbeSet::new(
+            r#type,
+            match r#type {
+                ProbeType::Kprobe => Box::new(kprobe::KprobeBuilder::new()),
+                ProbeType::RawTracepoint => Box::new(raw_tracepoint::RawTracepointBuilder::new()),
+                ProbeType::Max => bail!("Invalid probe type"),
+            },
+        );
+
+        set.targets.insert(key, symbol);
+
+        if self.hooks.len() == HOOK_MAX {
+            bail!("Hook list is already full");
+        }
+        set.hooks.push(hook);
+
+        self.targeted_probes.push(set);
+        Ok(())
+    }
+
     /// Request a hook to be attached to a specific target.
     ///
     /// ```
@@ -221,45 +292,8 @@ impl Kernel {
         r#type: ProbeType,
         target: &str,
     ) -> Result<()> {
-        let target = target.to_string();
-
-        // First check if the target isn't already registered to the generic
-        // probes list. If so, remove it from there.
-        let target_set = &mut self.probes[r#type as usize];
-        target_set.targets.remove(&target);
-
-        // Now check if we already have a targeted probe for this. If so, append
-        // the new hook to it.
-        for set in self.targeted_probes.iter_mut() {
-            if r#type == set.r#type && set.targets.get(&target).is_some() {
-                if self.hooks.len() + set.hooks.len() == HOOK_MAX {
-                    bail!("Hook list is already full");
-                }
-                set.hooks.push(hook);
-                return Ok(());
-            }
-        }
-
-        // New target, let's build a new probe set.
-        let mut set = ProbeSet::new(
-            r#type,
-            match r#type {
-                ProbeType::Kprobe => Box::new(kprobe::KprobeBuilder::new()),
-                ProbeType::RawTracepoint => Box::new(raw_tracepoint::RawTracepointBuilder::new()),
-                ProbeType::Max => bail!("Invalid probe type"),
-            },
-        );
-
-        let desc = self.inspect.inspect_target(&r#type, &target)?;
-        set.targets.insert(target.to_string(), desc);
-
-        if self.hooks.len() == HOOK_MAX {
-            bail!("Hook list is already full");
-        }
-        set.hooks.push(hook);
-
-        self.targeted_probes.push(set);
-        Ok(())
+        let symbol = Symbol::from_name(target)?;
+        self.register_hook_to_symbol(hook, r#type, symbol)
     }
 
     /// Attach all probes.
@@ -305,7 +339,9 @@ impl Kernel {
         set.builder.init(map_fds, hooks)?;
 
         // Then handle all targets in the set.
-        for (target, desc) in set.targets.iter() {
+        for (_, symbol) in set.targets.iter() {
+            let desc = inspect_symbol(symbol)?;
+
             // First load the probe configuration.
             #[cfg(not(test))]
             let config = unsafe { plain::as_bytes(&desc.probe_cfg) };
@@ -317,8 +353,8 @@ impl Kernel {
             )?;
 
             // Finally attach a probe to the target.
-            info!("Attaching probe to {}", target);
-            set.builder.attach(target, desc)?;
+            info!("Attaching probe to {}", symbol);
+            set.builder.attach(symbol, &desc)?;
         }
 
         Ok(())
@@ -338,7 +374,7 @@ pub(super) trait ProbeBuilder {
     /// accross builders.
     fn init(&mut self, map_fds: Vec<(String, i32)>, hooks: Vec<Hook>) -> Result<()>;
     /// Attach a probe to a given target (function, tracepoint, etc).
-    fn attach(&mut self, target: &str, desc: &TargetDesc) -> Result<()>;
+    fn attach(&mut self, symbol: &Symbol, desc: &TargetDesc) -> Result<()>;
 }
 
 pub(super) fn reuse_map_fds(
